@@ -750,6 +750,11 @@ class ModManager:
         self.installed_mods_file = INSTALLED_MODS_FILE
         self.ensure_config_dir()
         self.load_config()
+        
+        # Ensure mod_directory is always a string after initialization
+        if isinstance(self.config.get("mod_directory"), Path):
+            self.config["mod_directory"] = str(self.config["mod_directory"])
+            self.save_config()
     
     def ensure_config_dir(self):
         """Create config directory if it doesn't exist"""
@@ -787,8 +792,16 @@ class ModManager:
     def save_config(self):
         """Save configuration to file"""
         try:
+            # Ensure all Path objects are converted to strings before saving
+            config_to_save = {}
+            for key, value in self.config.items():
+                if isinstance(value, Path):
+                    config_to_save[key] = str(value)
+                else:
+                    config_to_save[key] = value
+            
             with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(config_to_save, f, indent=2)
         except Exception as e:
             console.print(f"[red]Error saving config: {e}[/red]")
     
@@ -918,6 +931,8 @@ class ModManager:
         mod_directory = self.config["mod_directory"]
         if isinstance(mod_directory, Path):
             mod_directory = str(mod_directory)
+            self.config["mod_directory"] = mod_directory
+            self.save_config()
         
         mod_dir = Path(mod_directory)
         
@@ -941,12 +956,17 @@ class ModManager:
         
         try:
             mod_files = list(mod_dir.glob("*.jar"))
+            # Convert all Path objects to ensure they're proper Path objects
+            mod_files = [Path(f) for f in mod_files]
         except (OSError, PermissionError) as e:
             console.print(f"[red]Error accessing mod directory {mod_dir}: {e}[/red]")
             return []
         
         if not mod_files:
             return []
+        
+        # Debug output to identify the issue
+        console.print(f"[dim]DEBUG: Found {len(mod_files)} mod files[/dim]")
         
         with Progress(
             SpinnerColumn(),
@@ -2076,7 +2096,7 @@ async def install_async():
 
 
 async def install_staged_mods(mod_manager: ModManager):
-    """Install all staged mods"""
+    """Install all staged mods with proper download progress tracking"""
     staged_mods = mod_manager.get_staged_mods()
     
     if not staged_mods:
@@ -2097,34 +2117,55 @@ async def install_staged_mods(mod_manager: ModManager):
     
     rate_limiter = RateLimiter()
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
-            DownloadColumn(),
         ) as progress:
             main_task = progress.add_task("Installing mods...", total=len(staged_mods))
             
             successful_installs = 0
             failed_installs = 0
             
-            for mod in staged_mods:
+            for i, mod in enumerate(staged_mods):
                 progress.update(main_task, description=f"Downloading {mod.name}...")
                 
                 try:
                     # Rate limiting
                     await rate_limiter.wait()
                     
-                    # Download mod file
-                    response = await client.get(mod.download_url)
-                    response.raise_for_status()
-                    
-                    # Save to mod directory
-                    mod_path = mod_dir / mod.filename
-                    with open(mod_path, 'wb') as f:
-                        f.write(response.content)
+                    # Download mod file with progress tracking
+                    async with client.stream("GET", mod.download_url) as response:
+                        response.raise_for_status()
+                        
+                        # Get content length for progress
+                        content_length = response.headers.get("content-length")
+                        if content_length:
+                            total_bytes = int(content_length)
+                            download_task = progress.add_task(
+                                f"  → {mod.name}", 
+                                total=total_bytes
+                            )
+                        else:
+                            download_task = progress.add_task(
+                                f"  → {mod.name}", 
+                                total=None
+                            )
+                        
+                        # Save to mod directory
+                        mod_path = mod_dir / mod.filename
+                        downloaded_bytes = 0
+                        
+                        with open(mod_path, 'wb') as f:
+                            async for chunk in response.aiter_bytes(8192):
+                                f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if content_length:
+                                    progress.update(download_task, advance=len(chunk))
+                        
+                        progress.remove_task(download_task)
                     
                     # Verify file hash if available
                     if mod.file_hash:
@@ -2142,7 +2183,7 @@ async def install_staged_mods(mod_manager: ModManager):
                     console.print(f"[red]✗[/red] Failed to install {mod.name}: {e}")
                     failed_installs += 1
                 
-                progress.advance(main_task)
+                progress.update(main_task, advance=1)
     
     # Summary
     console.print(f"\n[bold green]Installation complete![/bold green]")
@@ -2152,7 +2193,10 @@ async def install_staged_mods(mod_manager: ModManager):
     
     if successful_installs > 0:
         # Update installed mods record
-        mod_manager.get_installed_mods()  # This will rescan and update the record
+        try:
+            mod_manager.get_installed_mods()  # This will rescan and update the record
+        except Exception as e:
+            console.print(f"[red]Error updating installed mods record: {e}[/red]")
         
         if Confirm.ask("Clear staging area?"):
             mod_manager.clear_staging()
